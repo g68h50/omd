@@ -137,7 +137,10 @@ class Server:
         import pyodbc
         self.pyodbc = pyodbc
         self.driver = pick_driver(pyodbc, args.driver)
-        parts = [f"DRIVER={{{self.driver}}}", f"SERVER={args.server},{args.port}", "TrustServerCertificate=yes"]
+        # MARS: несколько активных наборов результатов на соединении — иначе незавершённые результаты
+        # одной команды дают «Connection is busy with results for another command» на следующей
+        parts = [f"DRIVER={{{self.driver}}}", f"SERVER={args.server},{args.port}", "TrustServerCertificate=yes",
+                 "MARS_Connection=yes"]
         if args.trusted:
             parts.append("Trusted_Connection=yes")
         else:
@@ -151,20 +154,54 @@ class Server:
         if db not in self.connections:
             c = self.pyodbc.connect(self.base + f";DATABASE={db}", autocommit=True)
             c.timeout = self.timeout
+            c.add_output_converter(-155, datetimeoffset_value)     # datetimeoffset: pyodbc не читает его сам
             self.connections[db] = c
         return self.connections[db]
 
+    def _execute(self, db: str, sql: str, params, fetch: bool):
+        """Выполнить и дочитать все наборы результатов; курсор закрывается всегда, после ошибки
+        соединение пересоздаётся (незавершённые результаты не остаются на нём). Если соединение всё же
+        занято чужими результатами («Connection is busy»), команда повторяется на новом соединении."""
+        try:
+            return self._execute_once(db, sql, params, fetch)
+        except self.pyodbc.Error as exc:
+            if "busy with results" not in str(exc).lower():
+                raise
+            self.reset(db)
+            return self._execute_once(db, sql, params, fetch)
+
+    def _execute_once(self, db: str, sql: str, params, fetch: bool):
+        cur = self.conn(db).cursor()
+        try:
+            cur.execute(sql, params)
+            first = None
+            while True:
+                if cur.description is not None:
+                    rows = cur.fetchall()
+                    if first is None:
+                        first = rows
+                if not cur.nextset():
+                    break
+            return first if fetch and first is not None else []
+        except self.pyodbc.Error:
+            self._close_cursor(cur)
+            self.reset(db)
+            raise
+        finally:
+            self._close_cursor(cur)
+
+    @staticmethod
+    def _close_cursor(cur) -> None:
+        try:
+            cur.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def rows(self, db: str, sql: str, params=()):
-        return self.conn(db).cursor().execute(sql, params).fetchall()
+        return self._execute(db, sql, params, fetch=True)
 
     def run(self, db: str, sql: str, params=()) -> None:
-        cur = self.conn(db).cursor()
-        cur.execute(sql, params)
-        while True:
-            if cur.description is not None:
-                cur.fetchall()
-            if not cur.nextset():
-                break
+        self._execute(db, sql, params, fetch=False)
 
     def reset(self, db: str) -> None:
         c = self.connections.pop(db, None)
@@ -177,6 +214,14 @@ class Server:
     def close(self):
         for db in list(self.connections):
             self.reset(db)
+
+
+def datetimeoffset_value(raw: bytes):
+    """datetimeoffset (тип ODBC -155) -> datetime с часовым поясом."""
+    import struct
+    y, mo, d, h, mi, s, ns, oh, om = struct.unpack("<6hI2h", raw)
+    tz = dt.timezone(dt.timedelta(hours=oh, minutes=om))
+    return dt.datetime(y, mo, d, h, mi, s, ns // 1000, tzinfo=tz)
 
 
 def short(exc: Exception) -> str:
