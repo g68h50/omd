@@ -61,6 +61,17 @@ CATEGORIES = {
 }
 FOLDER_TO_CATEGORY = {name: cat for cat, (_, names) in CATEGORIES.items() for name in names}
 MODULE_CATEGORIES = {"functions", "views", "procedures", "triggers"}
+
+# Скрипты SSMS начинаются с SET ANSI_NULLS / QUOTED_IDENTIFIER объекта, иногда OFF. Для таблиц и индексов это ломает
+# создание индексов на вычисляемых колонках, фильтрованных, XML- и пространственных индексов (ошибки 1934/1935),
+# а настройка сохраняется в таблице — повторный проход её не исправит. Поэтому перед каждым пакетом таблиц, типов,
+# последовательностей и синонимов выставляются обязательные настройки. Модули (процедуры, функции, представления,
+# триггеры) выполняются с настройками из файла: SQL Server хранит их вместе с кодом, и код может от них зависеть
+# (строки в двойных кавычках при QUOTED_IDENTIFIER OFF).
+REQUIRED_SET_OPTIONS = ("SET ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT, "
+                        "CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;")
+SET_ONLY_BATCH = re.compile(r"^\s*(SET\s+(ANSI_NULLS|QUOTED_IDENTIFIER|ANSI_PADDING|ANSI_WARNINGS|ARITHABORT|"
+                            r"CONCAT_NULL_YIELDS_NULL|NUMERIC_ROUNDABORT)\s+(ON|OFF)\s*;?\s*)+$", re.I)
 SYSTEM_DATABASES = {"master", "model", "msdb", "tempdb"}
 
 # ошибки «уже существует»: объект, индекс, ограничение, колонка, тип, схема
@@ -220,12 +231,22 @@ def pick_driver(pyodbc, wanted: str | None) -> str:
     return found[-1]
 
 
+def datetimeoffset_value(raw: bytes):
+    """datetimeoffset (тип ODBC -155) -> datetime с часовым поясом (pyodbc не читает его сам)."""
+    import datetime
+    import struct
+    y, mo, d, h, mi, s, ns, oh, om = struct.unpack("<6hI2h", raw)
+    tz = datetime.timezone(datetime.timedelta(hours=oh, minutes=om))
+    return datetime.datetime(y, mo, d, h, mi, s, ns // 1000, tzinfo=tz)
+
+
 class Server:
     def __init__(self, args):
         import pyodbc
         self.pyodbc = pyodbc
         driver = pick_driver(pyodbc, args.driver)
-        parts = [f"DRIVER={{{driver}}}", f"SERVER={args.server},{args.port}", "TrustServerCertificate=yes"]
+        parts = [f"DRIVER={{{driver}}}", f"SERVER={args.server},{args.port}", "TrustServerCertificate=yes",
+                 "MARS_Connection=yes"]   # иначе «Connection is busy with results for another command»
         if args.trusted:
             parts.append("Trusted_Connection=yes")
         else:
@@ -242,6 +263,7 @@ class Server:
         if database not in self.connections:
             c = self.pyodbc.connect(self.base + f";DATABASE={database}", autocommit=True)
             c.timeout = self.timeout
+            c.add_output_converter(-155, datetimeoffset_value)     # datetimeoffset: pyodbc не читает его сам
             self.connections[database] = c
         return self.connections[database]
 
@@ -303,10 +325,16 @@ def execute_item(srv: Server, item: Item) -> None:
     started = time.perf_counter()
     item.attempts += 1
     batches = split_batches(read_sql(item.path))
-    existed, errors = 0, []
+    existed, skipped, errors = 0, 0, []
+    module = item.category in MODULE_CATEGORIES
     for batch in batches:
-        sql = create_or_alter(batch) if item.category in MODULE_CATEGORIES else batch
+        if not module and SET_ONLY_BATCH.match(batch):
+            skipped += 1                  # SET ... OFF из скрипта таблицы не применяется (см. REQUIRED_SET_OPTIONS)
+            continue
+        sql = create_or_alter(batch) if module else batch
         try:
+            if not module:
+                srv.run(item.database, REQUIRED_SET_OPTIONS)
             srv.run(item.database, sql)
         except srv.pyodbc.Error as exc:
             if error_numbers(exc) & EXISTS_ERRORS:
@@ -319,7 +347,7 @@ def execute_item(srv: Server, item: Item) -> None:
     if errors:
         item.status, item.error = "failed", errors[0]
     else:
-        item.status, item.error = ("exists" if existed and existed == len(batches) else "ok"), ""
+        item.status, item.error = ("exists" if existed and existed + skipped == len(batches) else "ok"), ""
     # USE внутри файла меняет контекст соединения — следующий файл начинает в своей базе
     srv.reset(item.database)
 
